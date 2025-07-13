@@ -1,0 +1,206 @@
+# Template CI/CD Pipeline - GitHub Actions
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main, develop ]
+
+env:
+  NODE_VERSION: '18'
+  DOCKER_REGISTRY: 'your-registry.com'
+  PROJECT_NAME: 'your-project'
+
+jobs:
+  # Phase 1: Analyse de code et tests
+  code-quality:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: ${{ env.NODE_VERSION }}
+        cache: 'npm'
+    
+    - name: Install dependencies
+      run: npm ci
+    
+    - name: Lint code
+      run: npm run lint
+    
+    - name: Type check
+      run: npm run type-check
+    
+    - name: Run unit tests
+      run: npm run test:unit
+    
+    - name: Run integration tests
+      run: npm run test:integration
+    
+    - name: Generate test coverage
+      run: npm run test:coverage
+    
+    - name: Upload coverage to Codecov
+      uses: codecov/codecov-action@v3
+      with:
+        token: ${{ secrets.CODECOV_TOKEN }}
+
+  # Phase 2: Audit de sécurité
+  security-audit:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Run npm audit
+      run: npm audit --audit-level high
+    
+    - name: Run Snyk security scan
+      uses: snyk/actions/node@master
+      env:
+        SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+      with:
+        args: --severity-threshold=high
+    
+    - name: OWASP ZAP Security Scan
+      uses: zaproxy/action-full-scan@v0.7.0
+      with:
+        target: 'http://localhost:3000'
+
+  # Phase 3: Build et containerisation
+  build:
+    needs: [code-quality, security-audit]
+    runs-on: ubuntu-latest
+    outputs:
+      image-tag: ${{ steps.meta.outputs.tags }}
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: ${{ env.NODE_VERSION }}
+        cache: 'npm'
+    
+    - name: Install dependencies
+      run: npm ci
+    
+    - name: Build application
+      run: npm run build
+    
+    - name: Run build tests
+      run: npm run test:build
+    
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+    
+    - name: Log in to Docker Registry
+      uses: docker/login-action@v3
+      with:
+        registry: ${{ env.DOCKER_REGISTRY }}
+        username: ${{ secrets.DOCKER_USERNAME }}
+        password: ${{ secrets.DOCKER_PASSWORD }}
+    
+    - name: Extract metadata
+      id: meta
+      uses: docker/metadata-action@v5
+      with:
+        images: ${{ env.DOCKER_REGISTRY }}/${{ env.PROJECT_NAME }}
+        tags: |
+          type=ref,event=branch
+          type=ref,event=pr
+          type=sha,prefix={{branch}}-
+          type=raw,value=latest,enable={{is_default_branch}}
+    
+    - name: Build and push Docker image
+      uses: docker/build-push-action@v5
+      with:
+        context: .
+        push: true
+        tags: ${{ steps.meta.outputs.tags }}
+        labels: ${{ steps.meta.outputs.labels }}
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+
+  # Phase 4: Tests E2E
+  e2e-tests:
+    needs: build
+    runs-on: ubuntu-latest
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: ${{ env.NODE_VERSION }}
+        cache: 'npm'
+    
+    - name: Install dependencies
+      run: npm ci
+    
+    - name: Run E2E tests
+      run: npm run test:e2e
+    
+    - name: Performance tests with Lighthouse
+      uses: treosh/lighthouse-ci-action@v10
+      with:
+        configPath: './lighthouse.config.js'
+        uploadArtifacts: true
+
+  # Phase 5: Déploiement staging
+  deploy-staging:
+    needs: [build, e2e-tests]
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/develop'
+    environment: staging
+    
+    steps:
+    - name: Deploy to staging
+      run: |
+        # Script de déploiement staging
+        echo "Deploying to staging environment"
+        # kubectl apply -f k8s/staging/
+    
+    - name: Run smoke tests
+      run: npm run test:smoke:staging
+    
+    - name: Notify deployment
+      uses: 8398a7/action-slack@v3
+      with:
+        status: ${{ job.status }}
+        channel: '#deployments'
+        webhook_url: ${{ secrets.SLACK_WEBHOOK }}
+
+  # Phase 6: Déploiement production
+  deploy-production:
+    needs: [build, e2e-tests]
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    environment: production
+    
+    steps:
+    - name: Deploy to production
+      run: |
+        # Script de déploiement production avec blue-green
+        echo "Deploying to production environment"
+        # kubectl apply -f k8s/production/
+    
+    - name: Run smoke tests
+      run: npm run test:smoke:production
+    
+    - name: Health check
+      run: |
+        # Vérification santé application
+        curl -f http://your-app.com/health || exit 1
+    
+    - name: Notify deployment success
+      uses: 8398a7/action-slack@v3
+      with:
+        status: 'success'
+        channel: '#deployments'
+        webhook_url: ${{ secrets.SLACK_WEBHOOK }}
+        fields: repo,message,commit,author,took
